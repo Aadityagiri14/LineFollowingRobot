@@ -1,0 +1,47 @@
+#include <Wire.h>
+
+#define PI 3.14159
+#define potPin A0
+
+#define X_OFFSET 300
+#define Y_OFFSET 200
+#define X_SENS 1000
+#define Y_SENS 1000
+#define NOISE 50
+
+long magX = 0;
+long magY = 0;
+int potentiometer = 0;
+int heading = 0;
+
+void setup() {
+  Serial.begin(9600);
+  Serial.println("Begin");
+  Wire.begin(30);
+  Wire.onRequest(transmitValues);
+}
+
+void loop() {
+  delay(100);
+}
+
+void transmitValues() {
+  potentiometer = analogRead(A0);
+  heading = potentiometer * 360.0 / 1023.0;
+  Serial.println(heading);
+  magX = cos(heading * PI / 180) * X_SENS + X_OFFSET + random(-NOISE, NOISE);
+  magY = sin(heading * PI / 180) * Y_SENS + Y_OFFSET + random(-NOISE, NOISE);
+
+  magX += 32768;
+  magY += 32768;
+
+  byte magX_B1 = magX >> 8;
+  byte magX_B2 = magX & 0xFF;
+  byte magY_B1 = magY >> 8;
+  byte magY_B2 = magY & 0xFF;
+
+  Wire.write(magX_B1);
+  Wire.write(magX_B2);
+  Wire.write(magY_B1);
+  Wire.write(magY_B2);
+}
