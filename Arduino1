@@ -1,0 +1,323 @@
+#include <Wire.h>
+#include <Servo.h>
+
+#define motorPinA 11
+#define motorPinB 6
+#define lightPin A0
+#define ledPin 5
+#define encoderChannelA 2
+#define encoderChannelB 3
+#define steeringPin 13
+#define tempPin A1
+#define fanPin 8
+
+// Hardware constants
+const int resolution = 168;
+const int motorspeed = 698;
+const int motorrange = 255;
+
+int reqSpeed;
+bool lightflag = true;
+
+Servo Steer;
+const int straight = 90;
+const int hLeft = 150;
+const int sLeft = 110;
+const int hRight = 30;
+const int sRight = 70;
+const int close = 1500;
+const int range = 0;
+
+long X_mag = 0;
+long Y_mag = 0;
+
+int outValue1 = 0;
+int outValue2 = 0;
+int outValue3 = 0;
+int outValue4 = 0;
+int outValue5 = 0;
+int outValue6 = 0;
+int outValue7 = 0;
+int outValue8 = 0;
+
+const float Kp = 0.495;
+const float Ki = 0.01188;
+const float Kd = 0.00;
+
+unsigned long tlast = 0;
+
+float intError = 0;
+float oldError = 0;
+
+volatile unsigned long count = 0;
+volatile bool direction = true;
+
+void encoder_A_change() {
+  direction = digitalRead(encoderChannelA) == digitalRead(encoderChannelB);
+  ++count;
+}
+
+void encoder_B_change() {
+  ++count;
+}
+
+float encoder_rpm(unsigned long dt, bool print_speed) {
+  float cps = (((float)count) * 1000000) / dt;
+  count = 0;
+  float rpmSpeed = 60 * cps / (4 * resolution);
+
+  if (print_speed) {
+    Serial.print("Current: ");
+    if (direction)
+      Serial.print("");
+    else
+      Serial.print("-");
+    Serial.println((int)floor(rpmSpeed));
+  }
+  if (!direction)
+    rpmSpeed *= -1;
+  return rpmSpeed;
+}
+
+void setup() {
+  Serial.begin(9600);
+  Wire.begin();
+  Serial.println();
+  Serial.println("Starting");
+
+  pinMode(motorPinA, OUTPUT);
+  pinMode(motorPinB, OUTPUT);
+  digitalWrite(motorPinA, HIGH);
+  digitalWrite(motorPinB, LOW);
+
+  pinMode(ledPin, OUTPUT);
+
+  pinMode(tempPin, INPUT);
+  pinMode(fanPin, OUTPUT);
+
+  Steer.attach(13);
+  Steer.write(straight);
+  delay(300);
+
+  pinMode(encoderChannelA, INPUT);
+  pinMode(encoderChannelB, INPUT);
+  attachInterrupt(digitalPinToInterrupt(encoderChannelA), encoder_A_change, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(encoderChannelB), encoder_B_change, CHANGE);
+
+  tlast = micros();
+
+  count = 0;
+}
+
+float pingtime(int pin) {
+  pinMode(pin, OUTPUT);
+  digitalWrite(pin, LOW);
+  delayMicroseconds(4);
+  digitalWrite(pin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(pin, LOW);
+
+  pinMode(pin, INPUT);
+  float duration = pulseIn(pin, HIGH);
+}
+
+void loop() {
+  unsigned long tthis = micros();
+  unsigned long dt = tthis - tlast;
+
+  tlast = tthis;
+
+  while (Serial.available() > 1) {
+    int inputa = Serial.read();
+    int inputb = Serial.read();
+    reqSpeed = map(inputa, 65, 90, 0, 255);
+    int servoPos = map(inputb, 65, 90, 0, 180);
+    Steer.write(servoPos);
+  }
+
+  readmagnetometer();
+  Serial.print("X_mag:");
+  Serial.print(X_mag);
+  Serial.print(" , ");
+  Serial.print("Y_mag:");
+  Serial.print(Y_mag);
+
+  int tempSensor = analogRead(tempPin);
+  float temp = (((double)tempSensor * 5 / 1024) - 0.5) * 100;
+  Serial.print("Temperature: ");
+  Serial.print(temp);
+  Serial.println(" degrees C");
+
+  if (temp > 70)
+    overheat();
+
+  TempC = GET_TEMP();
+
+  if (TempC <= 19) {
+    FAN_SPEED(0);
+  } else if (TempC >= 25) {
+    FAN_SPEED(70);
+  }
+
+  int lightlevel = analogRead(lightPin);
+
+  if (lightlevel < 650)
+    digitalWrite(ledPin, HIGH);
+  if (lightlevel > 750)
+    digitalWrite(ledPin, LOW);
+
+  if (ledPin == HIGH)
+    lightflag = true;
+  else
+    lightflag = false;
+
+  int P9 = pingtime(9);
+  int P10 = pingtime(10);
+  int P12 = pingtime(12);
+
+  Serial.print("R ");
+  Serial.print(P9);
+  Serial.print("Fr");
+  Serial.println(P10);
+  Serial.print("L ");
+  Serial.println(P12);
+
+  if (P10 > 1000)
+    reqSpeed = 0.8885 * (P10 / 2) - 30;
+  else if (P10 >= 600)
+    reqSpeed = 10;
+  else if (P10 < 600)
+    reverseTurn();
+
+  float actSpeed = encoder_rpm(dt, false);
+
+  float curError = ((reqSpeed - actSpeed) * motorrange) / motorspeed;
+
+  intError += ((curError + oldError) / 2) * dt / 1E3;
+  float difError = (curError - oldError) * 1E3 / dt;
+
+  oldError = curError;
+
+  float setSpeed = Kp * curError + Ki * intError + Kd * difError;
+
+  reqSpeed = setSpeed;
+
+  if (reqSpeed > 255)
+    reqSpeed = 255;
+  else if (reqSpeed < -255)
+    reqSpeed = -255;
+
+  if (reqSpeed > 0) {
+    analogWrite(motorPinA, reqSpeed);
+    digitalWrite(motorPinB, LOW);
+  } else if (reqSpeed < 0) {
+    analogWrite(motorPinB, -reqSpeed);
+    digitalWrite(motorPinA, LOW);
+  }
+
+  if (P12 < P9 - 900 && P12 < close)
+    hardRight();
+  if (P12 - 900 > P9 && P9 < close)
+    hardLeft();
+  if (P12 < P9 - 900 && P12 > close)
+    softRight();
+  if (P12 - 900 > P9 && P9 > close)
+    softLeft();
+
+  outValue1 = map(P12, 0, 19280, 65, 90);
+  outValue2 = map(P10, 0, 19280, 65, 90);
+  outValue3 = map(P9, 0, 19280, 65, 90);
+  outValue4 = map(lightlevel, 0, 1015, 65, 90);
+  if (lightflag)
+    outValue5 = 66;
+  else
+    outValue5 = 65;
+  outValue6 = map(reqSpeed, 0, 255, 65, 90);
+  if (reverseTurn)
+    outValue7 = 66;
+  else
+    outValue7 = 65;
+  outValue8 = map(temp, -40.23, 124.80, 65, 90);
+  Serial.write(outValue1);
+  Serial.write(outValue2);
+  Serial.write(outValue3);
+  Serial.write(outValue4);
+  Serial.write(outValue5);
+  Serial.write(outValue6);
+  Serial.write(outValue7);
+  Serial.write(outValue8);
+  Serial.println();
+}
+
+void hardLeft() {
+  Steer.write(hLeft);
+  Steer.write(straight);
+  Serial.println("Hard Left");
+}
+
+void softLeft() {
+  Steer.write(sLeft);
+  Steer.write(straight);
+  Serial.println("Soft Left");
+}
+
+void hardRight() {
+  Steer.write(hRight);
+  Steer.write(straight);
+  Serial.println("Hard Right");
+}
+
+void softRight() {
+  Steer.write(sRight);
+  Steer.write(straight);
+  Serial.println("Soft Right");
+}
+
+void reverseTurn() {
+  Serial.println("Reverse Turn");
+  if (P12 > P9) {
+    Steer.write(hLeft);
+    reqSpeed = -30;
+    delay(1000);
+    reqSpeed = 1;
+    Steer.write(hRight);
+    reqSpeed = 30;
+    delay(1000);
+    Steer.write(straight);
+    delay(100);
+  } else {
+    Steer.write(hRight);
+    reqSpeed = -30;
+    delay(1000);
+    reqSpeed = 1;
+    Steer.write(hRight);
+    reqSpeed = 30;
+    delay(1000);
+    Steer.write(straight);
+    delay(100);
+  }
+}
+
+void overheat() {
+  Serial.println("Overheating, please wait...");
+  digitalWrite(motorPinA, LOW);
+  digitalWrite(motorPinB, LOW);
+  analogWrite(motorPinA, 30);
+  digitalWrite(motorPinB, LOW);
+}
+
+void readmagnetometer() {
+  long magX_B1;
+  long magX_B2;
+  long magY_B1;
+  long magY_B2;
+  Wire.requestFrom(30, 4);
+  while (Wire.available()) {
+    magX_B1 = Wire.read();
+    magX_B2 = Wire.read();
+    magY_B1 = Wire.read();
+    magY_B2 = Wire.read();
+  }
+  X_mag = magX_B1 * 256 + magX_B2 - 32798;
+  Y_mag = magY_B1 * 256 + magY_B2 - 32798;
+}
